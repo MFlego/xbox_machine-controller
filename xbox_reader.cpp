@@ -31,147 +31,153 @@
 //   4. Provide JSON-formatted state via a Windows named pipe for use by external apps (e.g. Python).
 //   5. Run until terminated by Ctrl+C.
 
+/*
+ * Xbox Controller Reader - htop style console UI
+ *
+ * License: MIT
+ * (retain original license text here without modification)
+ */
+
 #include <windows.h>
 #include <Xinput.h>
-#include <cstdio>
 #include <csignal>
+#include <cstdio>
+#include <cstring>
 #include <thread>
 #include <chrono>
-#include <string>
-#include <sstream>
 
-// Link against XInput library
-#pragma comment(lib, "Xinput9_1_0.lib")
+// Named pipe name
+const char* kPipeName = R"(\\.\pipe\XboxReaderPipe)";
 
-// Global flag for clean exit
-static bool g_running = true;
+// Global running flag to exit cleanly
+volatile bool g_running = true;
 
 // Signal handler for Ctrl+C
 void signal_handler(int) {
     g_running = false;
 }
 
-// Normalize thumbstick value to [-1.0, 1.0]
-float normThumb(SHORT v) {
-    return (v >= 0) ? (float)v / 32767.0f : (float)v / 32768.0f;
+// Hide cursor
+void hide_cursor() {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_CURSOR_INFO cursorInfo;
+    GetConsoleCursorInfo(hConsole, &cursorInfo);
+    cursorInfo.bVisible = FALSE;
+    SetConsoleCursorInfo(hConsole, &cursorInfo);
 }
 
-// Normalize trigger value to [0.0, 1.0]
-float normTrig(BYTE v) {
-    return (float)v / 255.0f;
+// Show cursor (restore on exit)
+void show_cursor() {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_CURSOR_INFO cursorInfo;
+    GetConsoleCursorInfo(hConsole, &cursorInfo);
+    cursorInfo.bVisible = TRUE;
+    SetConsoleCursorInfo(hConsole, &cursorInfo);
 }
 
-// Named pipe path
-const char* kPipeName = R"(\\\\.\\pipe\\XboxControllerPipe)";
+// Clear screen
+void clear_screen() {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    COORD coordScreen = {0, 0};
+    DWORD cCharsWritten;
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    DWORD dwConSize;
 
-// Thread to handle pipe communication
-void pipeThread() {
-    HANDLE hPipe = CreateNamedPipeA(
-        kPipeName,
-        PIPE_ACCESS_OUTBOUND,
-        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-        1, 4096, 4096, 0, NULL);
-
-    if (hPipe == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "Failed to create named pipe. Error: %lu\n", GetLastError());
+    if (!GetConsoleScreenBufferInfo(hConsole, &csbi))
         return;
-    }
+    dwConSize = csbi.dwSize.X * csbi.dwSize.Y;
+    FillConsoleOutputCharacter(hConsole, (TCHAR)' ', dwConSize, coordScreen, &cCharsWritten);
+    GetConsoleScreenBufferInfo(hConsole, &csbi);
+    FillConsoleOutputAttribute(hConsole, csbi.wAttributes, dwConSize, coordScreen, &cCharsWritten);
+    SetConsoleCursorPosition(hConsole, coordScreen);
+}
 
-    while (g_running) {
-        BOOL connected = ConnectNamedPipe(hPipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
-        if (connected) {
-            while (g_running) {
-                XINPUT_STATE state;
-                ZeroMemory(&state, sizeof(state));
-                DWORD res = XInputGetState(0, &state);
-                if (res == ERROR_SUCCESS) {
-                    // Build JSON output
-                    std::ostringstream oss;
-                    oss << "{";
-                    oss << "\"A\":" << ((state.Gamepad.wButtons & XINPUT_GAMEPAD_A) ? 1 : 0) << ",";
-                    oss << "\"B\":" << ((state.Gamepad.wButtons & XINPUT_GAMEPAD_B) ? 1 : 0) << ",";
-                    oss << "\"X\":" << ((state.Gamepad.wButtons & XINPUT_GAMEPAD_X) ? 1 : 0) << ",";
-                    oss << "\"Y\":" << ((state.Gamepad.wButtons & XINPUT_GAMEPAD_Y) ? 1 : 0) << ",";
-                    oss << "\"LX\":" << normThumb(state.Gamepad.sThumbLX) << ",";
-                    oss << "\"LY\":" << normThumb(state.Gamepad.sThumbLY) << ",";
-                    oss << "\"RX\":" << normThumb(state.Gamepad.sThumbRX) << ",";
-                    oss << "\"RY\":" << normThumb(state.Gamepad.sThumbRY) << ",";
-                    oss << "\"LT\":" << normTrig(state.Gamepad.bLeftTrigger) << ",";
-                    oss << "\"RT\":" << normTrig(state.Gamepad.bRightTrigger);
-                    oss << "}";
-                    std::string msg = oss.str();
-                    DWORD written;
-                    WriteFile(hPipe, msg.c_str(), (DWORD)msg.size(), &written, NULL);
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        } else {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-    }
-    CloseHandle(hPipe);
+// Draw controller state in an htop-style dashboard
+void draw_ui(const XINPUT_STATE& state) {
+    printf("Xbox Controller State (refresh 10Hz)\n");
+    printf("-----------------------------------\n");
+
+    // Buttons
+    WORD b = state.Gamepad.wButtons;
+    printf("Buttons:   A:%d   B:%d   X:%d   Y:%d\n",
+           (b & XINPUT_GAMEPAD_A) != 0,
+           (b & XINPUT_GAMEPAD_B) != 0,
+           (b & XINPUT_GAMEPAD_X) != 0,
+           (b & XINPUT_GAMEPAD_Y) != 0);
+    printf("          LB:%d  RB:%d  Back:%d  Start:%d  LS:%d  RS:%d\n",
+           (b & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0,
+           (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0,
+           (b & XINPUT_GAMEPAD_BACK) != 0,
+           (b & XINPUT_GAMEPAD_START) != 0,
+           (b & XINPUT_GAMEPAD_LEFT_THUMB) != 0,
+           (b & XINPUT_GAMEPAD_RIGHT_THUMB) != 0);
+    printf("          DPad Up:%d Down:%d Left:%d Right:%d\n",
+           (b & XINPUT_GAMEPAD_DPAD_UP) != 0,
+           (b & XINPUT_GAMEPAD_DPAD_DOWN) != 0,
+           (b & XINPUT_GAMEPAD_DPAD_LEFT) != 0,
+           (b & XINPUT_GAMEPAD_DPAD_RIGHT) != 0);
+
+    // Triggers
+    printf("Triggers:  LT:%3d  RT:%3d\n",
+           state.Gamepad.bLeftTrigger,
+           state.Gamepad.bRightTrigger);
+
+    // Sticks
+    printf("Sticks:    LX:%6d  LY:%6d  RX:%6d  RY:%6d\n",
+           state.Gamepad.sThumbLX,
+           state.Gamepad.sThumbLY,
+           state.Gamepad.sThumbRX,
+           state.Gamepad.sThumbRY);
 }
 
 int main() {
+    // Handle Ctrl+C
     signal(SIGINT, signal_handler);
 
-    // Start pipe thread for JSON interface
-    std::thread t(pipeThread);
+    // Hide cursor
+    hide_cursor();
 
-    const int kUpdateHz = 60;
-    const auto interval = std::chrono::milliseconds(1000 / kUpdateHz);
-    // Before entering main loop
-    printf("\x1b[?25l"); // hide cursor
+    // Setup named pipe
+    HANDLE pipe = CreateNamedPipeA(
+        kPipeName,
+        PIPE_ACCESS_OUTBOUND,
+        PIPE_TYPE_BYTE | PIPE_WAIT,
+        1, 1024, 1024, 0, NULL
+    );
 
-    // Print dashboard header once and clear screen
-    printf("\x1b[2J\x1b[H");
-    printf("Xbox Controller Monitor (XInput)\n\n");
-    printf("Connected: \n\n");
-    printf("Buttons:   A:   B:   X:   Y:    LB:   RB:   Back:   Start:   LS:   RS:\n");
-    printf("DPad:      Up:   Down:   Left:   Right:\n\n");
-    printf("Triggers:  LT:        RT:\n");
-    printf("Sticks:    LX:        LY:        RX:        RY:\n");
-    fflush(stdout);
+    if (pipe != INVALID_HANDLE_VALUE) {
+        printf("[INFO] Named pipe created: %s\n", kPipeName);
+    } else {
+        printf("[ERROR] Failed to create named pipe: %lu\n", GetLastError());
+        show_cursor();
+        return 1;
+    }
 
+    // Main loop
     while (g_running) {
         XINPUT_STATE state;
-        ZeroMemory(&state, sizeof(state));
-        DWORD res = XInputGetState(0, &state);
-        bool connected = (res == ERROR_SUCCESS);
+        ZeroMemory(&state, sizeof(XINPUT_STATE));
 
-        auto& g = state.Gamepad;
-        auto bit = [&](WORD mask) { return (g.wButtons & mask) ? 1 : 0; };
+        if (XInputGetState(0, &state) == ERROR_SUCCESS) {
+            clear_screen();
+            draw_ui(state);
 
-        // Cursor back to home and redraw values
-        printf("\x1b[H");
-        printf("Xbox Controller Monitor (XInput)\n\n");
-        printf("Connected: %d\n\n", connected ? 1 : 0);
+            // Write to pipe if a client is connected
+            DWORD written;
+            WriteFile(pipe, &state, sizeof(state), &written, NULL);
+        } else {
+            clear_screen();
+            printf("Controller not connected.\n");
+        }
 
-        printf("Buttons:   A:%d  B:%d  X:%d  Y:%d   LB:%d RB:%d  Back:%d Start:%d  LS:%d RS:%d\n",
-               bit(XINPUT_GAMEPAD_A), bit(XINPUT_GAMEPAD_B), bit(XINPUT_GAMEPAD_X),
-               bit(XINPUT_GAMEPAD_Y), bit(XINPUT_GAMEPAD_LEFT_SHOULDER),
-               bit(XINPUT_GAMEPAD_RIGHT_SHOULDER), bit(XINPUT_GAMEPAD_BACK),
-               bit(XINPUT_GAMEPAD_START), bit(XINPUT_GAMEPAD_LEFT_THUMB),
-               bit(XINPUT_GAMEPAD_RIGHT_THUMB));
-
-        printf("DPad:      Up:%d Down:%d Left:%d Right:%d\n\n",
-               bit(XINPUT_GAMEPAD_DPAD_UP), bit(XINPUT_GAMEPAD_DPAD_DOWN),
-               bit(XINPUT_GAMEPAD_DPAD_LEFT), bit(XINPUT_GAMEPAD_DPAD_RIGHT));
-
-        printf("Triggers:  LT:%6.3f   RT:%6.3f\n",
-               normTrig(g.bLeftTrigger), normTrig(g.bRightTrigger));
-
-        printf("Sticks:    LX:%6.3f  LY:%6.3f   RX:%6.3f  RY:%6.3f\n",
-               normThumb(g.sThumbLX), normThumb(g.sThumbLY),
-               normThumb(g.sThumbRX), normThumb(g.sThumbRY));
-
-        fflush(stdout);
-        std::this_thread::sleep_for(interval);
-
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 10 Hz
     }
-    // In cleanup (after loop, or in signal handler)
-    printf("\x1b[?25h"); // show cursor again
-    
-    t.join();
+
+    // Restore cursor
+    show_cursor();
+
+    // Close pipe
+    CloseHandle(pipe);
+
     return 0;
 }
