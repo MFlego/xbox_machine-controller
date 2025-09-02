@@ -11,9 +11,9 @@ First task:
 - Refactor xbox_reader.cpp so that controller input goes through an input abstraction layer. For now, the only backend will be XInput (Windows), but the design should allow plugging in alternatives later (e.g., SDL2, Linux evdev, macOS IOKit/HID). The main loop, JSON output, and UI should remain unchanged — only the controller input logic should be abstracted.
 
 - Please generate a refactored version of xbox_reader.cpp that:
-- Preserves the current behavior (same UI, same JSON output, same named pipe).
-- Adds a clean input abstraction (interface class or similar).
-- Keeps the existing license and comments intact.
+  - Preserves the current behavior (same UI, same JSON output, same named pipe).
+  - Adds a clean input abstraction (interface class or similar).
+  - Keeps the existing license and comments intact.
 
 # Second Task: Python Transport Abstraction #
 - Now that the C++ side has an input abstraction layer, we want to extend the Python interface (xbox_pipe_reader.py) to support multiple transport mechanisms beyond the Windows named pipe.
