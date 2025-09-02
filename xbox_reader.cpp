@@ -60,6 +60,15 @@ SOFTWARE.
 
 #pragma comment(lib, "Xinput9_1_0.lib")
 
+// Helper macro for console output
+#define WRITE_CONSOLE(msg) do { \
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE); \
+    if (hOut != INVALID_HANDLE_VALUE) { \
+        DWORD written; \
+        WriteConsoleA(hOut, msg, (DWORD)strlen(msg), &written, nullptr); \
+    } \
+} while(0)
+
 // Utility functions for normalizing input values
 // Normalize thumb values [-32768, 32767] -> [-1.0, 1.0]
 static inline double normThumb(SHORT v)
@@ -154,6 +163,8 @@ static const char* kPipeName        = "\\\\.\\pipe\\XboxReaderPipe"; // final fo
 
 // Globals for clean shutdown
 static std::atomic<bool> g_running{true};
+static std::atomic<bool> g_pipeActive{false};
+static HANDLE g_activePipe = INVALID_HANDLE_VALUE;
 
 // Latest JSON snapshot shared with the pipe thread
 static std::mutex              g_jsonMutex;
@@ -192,10 +203,38 @@ static void InitializeConsole()
 }
 
 // Restore console to its original state
+// Safe pipe cleanup
+static void CleanupPipe(HANDLE hPipe) {
+    if (hPipe != INVALID_HANDLE_VALUE) {
+        // Disable error reporting during cleanup
+        DWORD oldMode = SetErrorMode(SEM_FAILCRITICALERRORS);
+        
+        if (g_pipeActive) {
+            FlushFileBuffers(hPipe);
+            DisconnectNamedPipe(hPipe);
+            g_pipeActive = false;
+        }
+        CloseHandle(hPipe);
+        
+        SetErrorMode(oldMode);
+    }
+}
+
 static void RestoreConsole()
 {
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     if (hOut == INVALID_HANDLE_VALUE) return;
+
+    // Clear screen
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (GetConsoleScreenBufferInfo(hOut, &csbi)) {
+        DWORD written;
+        DWORD length = csbi.dwSize.X * csbi.dwSize.Y;
+        COORD topLeft = {0, 0};
+        FillConsoleOutputCharacter(hOut, ' ', length, topLeft, &written);
+        FillConsoleOutputAttribute(hOut, csbi.wAttributes, length, topLeft, &written);
+        SetConsoleCursorPosition(hOut, topLeft);
+    }
 
     // Restore cursor
     if (g_savedCursorInfoValid) {
@@ -330,67 +369,69 @@ static std::string BuildJson(const IControllerInput::State& state)
 // Named pipe writer thread: waits for client & streams snapshots
 static void PipeThread()
 {
-    for (; g_running.load(); ) {
-        // Create a fresh instance so new clients can connect after disconnect
+    while (g_running.load()) {
         HANDLE hPipe = CreateNamedPipeA(
             kPipeName,
             PIPE_ACCESS_OUTBOUND,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1,      // max instances
-            16*1024,// out buffer
-            16*1024,// in buffer
+            1,
+            16*1024,
+            16*1024,
             0,
-            nullptr);
+            nullptr
+        );
 
         if (hPipe == INVALID_HANDLE_VALUE) {
-            // If creation failed, wait and retry
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
             continue;
         }
 
-        // Wait for a client to connect (blocks here)
-        BOOL connected = ConnectNamedPipe(hPipe, nullptr) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
-        if (!connected) {
-            CloseHandle(hPipe);
-            continue;
-        }
+        g_activePipe = hPipe;  // Store globally for cleanup
 
-        // Stream JSON snapshots while client is connected
-        std::unique_lock<std::mutex> lk(g_jsonMutex);
-        while (g_running.load()) {
-            // Wait for an update (notified by main loop)
-            g_jsonCv.wait(lk);
-            if (!g_running.load()) break;
-            std::string snapshot = g_latestJson; // copy snapshot under lock
+        // Wait for client
+        if (ConnectNamedPipe(hPipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
+            g_pipeActive = true;
+            WRITE_CONSOLE("Client connected to pipe.\n");
+
+            std::unique_lock<std::mutex> lk(g_jsonMutex);
+            while (g_running.load() && g_pipeActive) {
+                g_jsonCv.wait(lk);
+                if (!g_running.load()) break;
+
+                std::string snapshot = g_latestJson;
+                lk.unlock();
+
+                DWORD written;
+                BOOL ok = WriteFile(hPipe, snapshot.data(), (DWORD)snapshot.size(), &written, nullptr);
+                if (ok) {
+                    const char nl = '\n';
+                    ok = WriteFile(hPipe, &nl, 1, &written, nullptr);
+                }
+
+                if (!ok) {
+                    WRITE_CONSOLE("Client disconnected.\n");
+                    g_pipeActive = false;
+                }
+
+                lk.lock();
+            }
             lk.unlock();
-
-            // Write snapshot + newline (ensure utf-8 JSON text)
-            DWORD written = 0;
-            BOOL ok = WriteFile(hPipe, snapshot.data(), (DWORD)snapshot.size(), &written, nullptr);
-            if (ok) {
-                const char nl = '\n';
-                ok = WriteFile(hPipe, &nl, 1, &written, nullptr);
-            }
-            if (!ok) {
-                // client disconnected or error
-                break;
-            }
-            lk.lock();
         }
-        lk.unlock();
-        FlushFileBuffers(hPipe);
-        DisconnectNamedPipe(hPipe);
-        CloseHandle(hPipe);
+
+        CleanupPipe(hPipe);
+        g_activePipe = INVALID_HANDLE_VALUE;
+
+        if (!g_running.load()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 
 int main()
 {
-    // Setup console + signal handler
+    SetErrorMode(SEM_NOGPFAULTERRORBOX);  // Suppress Windows Error Reporting dialog
     SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
     InitializeConsole();
 
-    // Print a small header (will be overwritten by double-buffered frames)
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD dummy = 0;
     const char *startup = "Xbox Controller Monitor (starting)...\n";
@@ -404,8 +445,9 @@ int main()
     // Create controller input interface
     auto controller = std::make_unique<XInputController>(kControllerIndex);
     if (!controller->init()) {
-        const char *err = "Failed to initialize controller input\n";
-        WriteConsoleA(hOut, err, (DWORD)strlen(err), &dummy, nullptr);
+        WRITE_CONSOLE("Failed to initialize controller input\n");
+        g_running.store(false);
+        if (pipeThr.joinable()) pipeThr.join();
         return 1;
     }
 
@@ -436,52 +478,37 @@ int main()
         std::this_thread::sleep_for(interval);
     }
 
-    // Shutdown sequence with timeout
-    auto shutdownStart = std::chrono::steady_clock::now();
-    const auto shutdownTimeout = std::chrono::milliseconds(1000); // 1 second timeout
+    // Clean shutdown sequence
+    WRITE_CONSOLE("\nCleaning up...\n");
     
     g_running.store(false);
     g_jsonCv.notify_all();
     
-    // Cleanup with timeout checks
     if (controller) {
         controller->shutdown();
         controller.reset();
     }
-    
+
+    // Clean up pipe if active
+    if (g_activePipe != INVALID_HANDLE_VALUE) {
+        CleanupPipe(g_activePipe);
+        g_activePipe = INVALID_HANDLE_VALUE;
+    }
+
     // Wait for pipe thread with timeout
     if (pipeThr.joinable()) {
-        std::thread([&pipeThr]{
+        auto future = std::async(std::launch::async, [&pipeThr]() {
             pipeThr.join();
-        }).detach();
+        });
+        
+        if (future.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready) {
+            // If thread doesn't join in time, we'll exit anyway
+            WRITE_CONSOLE("Forcing exit due to timeout...\n");
+            ExitProcess(0);
+        }
     }
 
-    // Get console info for proper clearing
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-    GetConsoleScreenBufferInfo(hOut, &csbi);
-    
-    // Clear entire screen buffer
-    DWORD written;
-    DWORD length = csbi.dwSize.X * csbi.dwSize.Y;
-    COORD topLeft = {0, 0};
-    FillConsoleOutputCharacter(hOut, ' ', length, topLeft, &written);
-    FillConsoleOutputAttribute(hOut, csbi.wAttributes, length, topLeft, &written);
-    
-    // Reset cursor position to top
-    SetConsoleCursorPosition(hOut, topLeft);
-    
-    // Restore cursor visibility
-    CONSOLE_CURSOR_INFO cursorInfo = {100, TRUE};
-    SetConsoleCursorInfo(hOut, &cursorInfo);
-    
-    // Print final message
-    const char *bye = "Xbox Controller Monitor: Shutdown complete.\n";
-    WriteConsoleA(hOut, bye, (DWORD)strlen(bye), &written, nullptr);
-    
-    // If we're taking too long, just exit
-    if (std::chrono::steady_clock::now() - shutdownStart > shutdownTimeout) {
-        ExitProcess(0);
-    }
-
+    RestoreConsole();
+    WRITE_CONSOLE("Xbox Controller Monitor: Shutdown complete.\n");
     return 0;
 }
